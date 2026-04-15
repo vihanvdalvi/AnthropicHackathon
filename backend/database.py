@@ -7,7 +7,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/campus_pulse"
+    "sqlite+aiosqlite:///./campus_pulse.db"
 )
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -24,8 +24,6 @@ async def get_db():
 
 
 async def init_db():
-    """Create all tables and ensure pgvector extension exists."""
     async with engine.begin() as conn:
-        await conn.execute(__import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector"))
-        from backend import models  # noqa: F401 — registers models with Base
+        from backend import models  # noqa: F401
         await conn.run_sync(Base.metadata.create_all)

@@ -1,20 +1,16 @@
 """
 Campus Pulse AI — FastAPI backend
-Person A owns this file.
 """
 
+import json
 import random
-import string
 from datetime import date, datetime, timezone
 from typing import Any
-from uuid import UUID
-
-import numpy as np
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import select, func, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db, init_db
@@ -25,7 +21,7 @@ app = FastAPI(title="Campus Pulse AI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # tighten in prod
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -37,7 +33,7 @@ async def startup():
 
 
 # ---------------------------------------------------------------------------
-# Helper: anonymous name generator
+# Anonymous name generator
 # ---------------------------------------------------------------------------
 
 _ADJECTIVES = [
@@ -55,14 +51,33 @@ _NOUNS = [
 
 
 def _gen_anon_name() -> str:
-    adj = random.choice(_ADJECTIVES)
-    noun = random.choice(_NOUNS)
-    num = random.randint(1, 99)
-    return f"{adj}{noun}{num:02d}"
+    return f"{random.choice(_ADJECTIVES)}{random.choice(_NOUNS)}{random.randint(1, 99):02d}"
+
+
+def _load_json(val) -> list:
+    if not val:
+        return []
+    if isinstance(val, list):
+        return val
+    try:
+        return json.loads(val)
+    except Exception:
+        return []
+
+
+def _load_dict(val) -> dict:
+    if not val:
+        return {}
+    if isinstance(val, dict):
+        return val
+    try:
+        return json.loads(val)
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
-# Pydantic request/response schemas
+# Pydantic schemas
 # ---------------------------------------------------------------------------
 
 class CreateUserResponse(BaseModel):
@@ -128,156 +143,111 @@ class SurveyRequest(BaseModel):
 
 @app.post("/api/users", response_model=CreateUserResponse, status_code=201)
 async def create_user(db: AsyncSession = Depends(get_db)):
-    """Create an anonymous user with a generated name."""
-    # Try up to 10 times to find a unique name
     for _ in range(10):
         name = _gen_anon_name()
         existing = await db.execute(select(User).where(User.anon_name == name))
         if existing.scalar_one_or_none() is None:
             break
-
     user = User(anon_name=name, lean_score=None)
     db.add(user)
     await db.commit()
     await db.refresh(user)
-    return CreateUserResponse(id=str(user.id), anon_name=user.anon_name)
+    return CreateUserResponse(id=user.id, anon_name=user.anon_name)
 
 
 @app.post("/api/posts", response_model=SubmitPostResponse, status_code=201)
 async def submit_post(req: SubmitPostRequest, db: AsyncSession = Depends(get_db)):
-    """
-    Accept a free-text opinion, embed it, classify into an issue cluster,
-    score sentiment/intensity, persist, and update issue aggregates.
-    """
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Post text cannot be empty.")
 
-    # 1. Embed
-    embedding = await ml.embed_text(text)
-
-    # 2. Score sentiment/intensity + privately infer lean (never returned via API)
+    # Score sentiment/intensity + privately infer lean
     sentiment, intensity = await ml.score_post(text)
     inferred_lean = await ml.infer_lean(text)
 
-    # 3. Classify — fetch all issue embeddings via a representative post per issue
+    # Classify into existing issue via LLM
     issue_rows = (await db.execute(select(Issue))).scalars().all()
-
-    # Build issue centroid embeddings from their posts
-    issue_embeddings: list[tuple[str, list[float]]] = []
-    for issue in issue_rows:
-        posts_q = await db.execute(
-            select(Post.embedding)
-            .where(Post.issue_id == issue.id, Post.embedding.isnot(None))
-            .limit(20)
-        )
-        vecs = [row[0] for row in posts_q.fetchall() if row[0] is not None]
-        if vecs:
-            centroid = list(np.mean(vecs, axis=0))
-            issue_embeddings.append((str(issue.id), centroid))
-
-    matched_issue_id = await ml.classify_post(embedding, issue_embeddings)
+    issue_pairs = [(i.id, i.label) for i in issue_rows]
+    matched_issue_id = await ml.classify_post(text, issue_pairs)
 
     if matched_issue_id:
-        issue = await db.get(Issue, UUID(matched_issue_id))
-    else:
-        # Create new issue
+        issue = (await db.execute(select(Issue).where(Issue.id == matched_issue_id))).scalar_one_or_none()
+        if not issue:
+            matched_issue_id = None
+
+    if not matched_issue_id:
         label = await ml.label_new_issue(text)
         issue = Issue(
             label=label,
-            week_start=date.today(),
+            week_start=date.today().isoformat(),
             post_count=0,
             sentiment_avg=0.0,
             intensity_avg=0.0,
             rank_score=0.0,
         )
         db.add(issue)
-        await db.flush()  # get issue.id
+        await db.flush()
 
-    # 4. Update user lean_score privately (running average; never returned via API)
-    user_uuid = UUID(req.user_id) if req.user_id else None
-    if user_uuid:
-        user_row = await db.get(User, user_uuid)
+    # Update user lean_score privately
+    if req.user_id:
+        user_row = (await db.execute(select(User).where(User.id == req.user_id))).scalar_one_or_none()
         if user_row:
             if user_row.lean_score is None:
                 user_row.lean_score = inferred_lean
             else:
-                # Exponential moving average — recent posts weighted slightly more
                 user_row.lean_score = round(0.7 * user_row.lean_score + 0.3 * inferred_lean, 4)
 
-    # 5. Persist post
+    # Persist post
     post = Post(
-        user_id=user_uuid,
+        user_id=req.user_id,
         issue_id=issue.id,
         text=text,
-        embedding=embedding,
         sentiment=sentiment,
         intensity=intensity,
     )
     db.add(post)
 
-    # 6. Update issue aggregates
+    # Update issue aggregates
     new_count = issue.post_count + 1
-    issue.sentiment_avg = (
-        (issue.sentiment_avg * issue.post_count + sentiment) / new_count
-    )
-    issue.intensity_avg = (
-        (issue.intensity_avg * issue.post_count + intensity) / new_count
-    )
+    issue.sentiment_avg = round((issue.sentiment_avg * issue.post_count + sentiment) / new_count, 4)
+    issue.intensity_avg = round((issue.intensity_avg * issue.post_count + intensity) / new_count, 4)
     issue.post_count = new_count
     issue.rank_score = ml.compute_rank_score(
-        new_count,
-        issue.intensity_avg,
+        new_count, issue.intensity_avg,
         ml.recency_weight(datetime.now(timezone.utc)),
     )
     issue.updated_at = datetime.utcnow()
 
-    # 7. Optionally refresh summary if post_count crosses a threshold
-    SUMMARY_THRESHOLDS = {5, 10, 20, 50}
-    if new_count in SUMMARY_THRESHOLDS:
-        posts_q = await db.execute(
-            select(Post.text).where(Post.issue_id == issue.id).limit(80)
-        )
+    # Refresh summary at thresholds
+    if new_count in {5, 10, 20, 50}:
+        posts_q = await db.execute(select(Post.text).where(Post.issue_id == issue.id).limit(80))
         all_texts = [r[0] for r in posts_q.fetchall()]
         summary_data = await ml.summarize_issue(issue.label, all_texts)
         issue.summary = summary_data["summary"]
-        issue.side_a_points = summary_data["side_a_points"]
-        issue.side_b_points = summary_data["side_b_points"]
-        issue.shared_concerns = summary_data["shared_concerns"]
+        issue.side_a_points = json.dumps(summary_data["side_a_points"])
+        issue.side_b_points = json.dumps(summary_data["side_b_points"])
+        issue.shared_concerns = json.dumps(summary_data["shared_concerns"])
 
     await db.commit()
     await db.refresh(post)
     await db.refresh(issue)
 
-    return SubmitPostResponse(
-        post_id=str(post.id),
-        issue_id=str(issue.id),
-        issue_label=issue.label,
-    )
+    return SubmitPostResponse(post_id=post.id, issue_id=issue.id, issue_label=issue.label)
 
 
 @app.get("/api/issues", response_model=list[IssueListItem])
 async def get_issues(db: AsyncSession = Depends(get_db)):
-    """Return top 10 issues ranked by rank_score for the current week."""
+    today = date.today().isoformat()
     result = await db.execute(
-        select(Issue)
-        .where(Issue.week_start == date.today())
-        .order_by(Issue.rank_score.desc())
-        .limit(10)
+        select(Issue).where(Issue.week_start == today).order_by(Issue.rank_score.desc()).limit(10)
     )
     issues = result.scalars().all()
-
-    # Fallback: if no issues for today, return the overall top 10
     if not issues:
-        result = await db.execute(
-            select(Issue).order_by(Issue.rank_score.desc()).limit(10)
-        )
+        result = await db.execute(select(Issue).order_by(Issue.rank_score.desc()).limit(10))
         issues = result.scalars().all()
-
     return [
         IssueListItem(
-            id=str(i.id),
-            label=i.label,
+            id=i.id, label=i.label,
             sentiment_avg=i.sentiment_avg or 0.0,
             intensity_avg=i.intensity_avg or 0.0,
             post_count=i.post_count or 0,
@@ -289,28 +259,24 @@ async def get_issues(db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/issues/{issue_id}", response_model=IssueDetail)
 async def get_issue(issue_id: str, db: AsyncSession = Depends(get_db)):
-    """Full issue detail including unbiased summary and empathy stats."""
-    issue = await db.get(Issue, UUID(issue_id))
+    issue = (await db.execute(select(Issue).where(Issue.id == issue_id))).scalar_one_or_none()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found.")
 
-    # Lazy-generate summary if missing and there are posts
+    # Lazy-generate summary if missing
     if not issue.summary and issue.post_count > 0:
-        posts_q = await db.execute(
-            select(Post.text).where(Post.issue_id == issue.id).limit(80)
-        )
+        posts_q = await db.execute(select(Post.text).where(Post.issue_id == issue.id).limit(80))
         all_texts = [r[0] for r in posts_q.fetchall()]
         if all_texts:
             summary_data = await ml.summarize_issue(issue.label, all_texts)
             issue.summary = summary_data["summary"]
-            issue.side_a_points = summary_data["side_a_points"]
-            issue.side_b_points = summary_data["side_b_points"]
-            issue.shared_concerns = summary_data["shared_concerns"]
+            issue.side_a_points = json.dumps(summary_data["side_a_points"])
+            issue.side_b_points = json.dumps(summary_data["side_b_points"])
+            issue.shared_concerns = json.dumps(summary_data["shared_concerns"])
             await db.commit()
             await db.refresh(issue)
 
-    # Fetch empathy stats
-    stat_row = await db.get(EmpathyStat, UUID(issue_id))
+    stat_row = (await db.execute(select(EmpathyStat).where(EmpathyStat.issue_id == issue_id))).scalar_one_or_none()
     empathy = None
     if stat_row:
         empathy = EmpathyStatsSchema(
@@ -323,12 +289,10 @@ async def get_issue(issue_id: str, db: AsyncSession = Depends(get_db)):
         )
 
     return IssueDetail(
-        id=str(issue.id),
-        label=issue.label,
-        summary=issue.summary,
-        side_a_points=issue.side_a_points or [],
-        side_b_points=issue.side_b_points or [],
-        shared_concerns=issue.shared_concerns or [],
+        id=issue.id, label=issue.label, summary=issue.summary,
+        side_a_points=_load_json(issue.side_a_points),
+        side_b_points=_load_json(issue.side_b_points),
+        shared_concerns=_load_json(issue.shared_concerns),
         sentiment_avg=issue.sentiment_avg or 0.0,
         intensity_avg=issue.intensity_avg or 0.0,
         post_count=issue.post_count or 0,
@@ -338,44 +302,34 @@ async def get_issue(issue_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/survey", status_code=201)
 async def submit_survey(req: SurveyRequest, db: AsyncSession = Depends(get_db)):
-    """Persist survey response and recompute empathy stats for the issue."""
-    issue = await db.get(Issue, UUID(req.issue_id))
+    issue = (await db.execute(select(Issue).where(Issue.id == req.issue_id))).scalar_one_or_none()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found.")
 
-    user_uuid = UUID(req.user_id) if req.user_id else None
     response = SurveyResponse(
-        user_id=user_uuid,
-        issue_id=issue.id,
+        user_id=req.user_id,
+        issue_id=req.issue_id,
         starting_position=req.starting_position,
         pre_intensity=req.pre_intensity,
         post_feeling=req.post_feeling,
         empathy_choice=req.empathy_choice,
-        statement_ratings=req.statement_ratings,
+        statement_ratings=json.dumps(req.statement_ratings) if req.statement_ratings else None,
     )
     db.add(response)
     await db.flush()
-
-    # Recompute empathy stats
-    await _recompute_empathy_stats(db, issue.id)
+    await _recompute_empathy_stats(db, req.issue_id)
     await db.commit()
-
     return {"success": True}
 
 
 @app.get("/api/stats/{issue_id}", response_model=EmpathyStatsSchema)
 async def get_stats(issue_id: str, db: AsyncSession = Depends(get_db)):
-    """Return precomputed empathy analytics for an issue."""
-    stat = await db.get(EmpathyStat, UUID(issue_id))
+    stat = (await db.execute(select(EmpathyStat).where(EmpathyStat.issue_id == issue_id))).scalar_one_or_none()
     if not stat:
-        # Return zeroes rather than 404 — issue may exist but have no survey data yet
         return EmpathyStatsSchema(
-            perspective_shift_rate=0.0,
-            conflict_deepening_rate=0.0,
-            shared_concern_index=0.0,
-            intensity_delta=0.0,
-            cross_position_empathy_score=0.0,
-            total_respondents=0,
+            perspective_shift_rate=0.0, conflict_deepening_rate=0.0,
+            shared_concern_index=0.0, intensity_delta=0.0,
+            cross_position_empathy_score=0.0, total_respondents=0,
         )
     return EmpathyStatsSchema(
         perspective_shift_rate=stat.perspective_shift_rate or 0.0,
@@ -388,26 +342,11 @@ async def get_stats(issue_id: str, db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Internal: empathy stats recomputation
+# Empathy stats recomputation
 # ---------------------------------------------------------------------------
 
-async def _recompute_empathy_stats(db: AsyncSession, issue_id: UUID):
-    """
-    Recompute all empathy metrics from survey_responses for a given issue.
-
-    Metrics:
-    - perspective_shift_rate:    % who chose post_feeling 1 or 2 (shifted or understood better)
-    - conflict_deepening_rate:   % who chose post_feeling 3 (felt more strongly opposed)
-    - shared_concern_index:      avg of statement 4 ("common ground…") rating / 10
-    - intensity_delta:           avg(pre_intensity) subtracted from inferred post_intensity
-                                 (we use post_feeling=4 → conflicted as proxy for +intensity)
-    - cross_position_empathy_score: avg of all statement_ratings / 10
-    """
-    rows_q = await db.execute(
-        select(SurveyResponse).where(SurveyResponse.issue_id == issue_id)
-    )
-    rows = rows_q.scalars().all()
-
+async def _recompute_empathy_stats(db: AsyncSession, issue_id: str):
+    rows = (await db.execute(select(SurveyResponse).where(SurveyResponse.issue_id == issue_id))).scalars().all()
     n = len(rows)
     if n == 0:
         return
@@ -415,24 +354,21 @@ async def _recompute_empathy_stats(db: AsyncSession, issue_id: UUID):
     shift = sum(1 for r in rows if r.post_feeling in (1, 2))
     deepen = sum(1 for r in rows if r.post_feeling == 3)
 
-    # shared_concern_index: statement index 4 ("There's more common ground…"), 1-indexed key "4"
-    shared_vals = []
-    all_ratings = []
+    shared_vals, all_ratings = [], []
     for r in rows:
-        if r.statement_ratings:
-            ratings_vals = list(r.statement_ratings.values())
-            all_ratings.extend(ratings_vals)
-            # statement index 4 (0-based) is "There's more common ground…" — last of 5
-            key = str(len(r.statement_ratings) - 1)
-            if key in r.statement_ratings:
-                shared_vals.append(float(r.statement_ratings[key]))
+        ratings = _load_dict(r.statement_ratings)
+        if ratings:
+            vals = list(ratings.values())
+            all_ratings.extend(vals)
+            # statement index 4 (0-based) = "There's more common ground…"
+            key = str(len(ratings) - 1)
+            if key in ratings:
+                shared_vals.append(float(ratings[key]))
 
     shared_concern_index = (sum(shared_vals) / len(shared_vals) / 10.0) if shared_vals else 0.0
-
     cross_pos = (sum(all_ratings) / len(all_ratings) / 10.0) if all_ratings else 0.0
 
     pre_intensities = [r.pre_intensity for r in rows if r.pre_intensity is not None]
-    # Infer post-intensity: post_feeling=2 (shifted) or 4 (conflicted) → assume +1
     post_intensities = [
         (pi + 1.0) if r.post_feeling in (2, 4) else pi
         for r, pi in zip(rows, pre_intensities)
@@ -443,7 +379,7 @@ async def _recompute_empathy_stats(db: AsyncSession, issue_id: UUID):
         if pre_intensities else 0.0
     )
 
-    stat = await db.get(EmpathyStat, issue_id)
+    stat = (await db.execute(select(EmpathyStat).where(EmpathyStat.issue_id == issue_id))).scalar_one_or_none()
     if stat is None:
         stat = EmpathyStat(issue_id=issue_id)
         db.add(stat)
