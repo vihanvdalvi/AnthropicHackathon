@@ -9,6 +9,8 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import UUID
 
+import numpy as np
+
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -154,8 +156,9 @@ async def submit_post(req: SubmitPostRequest, db: AsyncSession = Depends(get_db)
     # 1. Embed
     embedding = await ml.embed_text(text)
 
-    # 2. Score
+    # 2. Score sentiment/intensity + privately infer lean (never returned via API)
     sentiment, intensity = await ml.score_post(text)
+    inferred_lean = await ml.infer_lean(text)
 
     # 3. Classify — fetch all issue embeddings via a representative post per issue
     issue_rows = (await db.execute(select(Issue))).scalars().all()
@@ -170,7 +173,6 @@ async def submit_post(req: SubmitPostRequest, db: AsyncSession = Depends(get_db)
         )
         vecs = [row[0] for row in posts_q.fetchall() if row[0] is not None]
         if vecs:
-            import numpy as np
             centroid = list(np.mean(vecs, axis=0))
             issue_embeddings.append((str(issue.id), centroid))
 
@@ -192,8 +194,18 @@ async def submit_post(req: SubmitPostRequest, db: AsyncSession = Depends(get_db)
         db.add(issue)
         await db.flush()  # get issue.id
 
-    # 4. Persist post
+    # 4. Update user lean_score privately (running average; never returned via API)
     user_uuid = UUID(req.user_id) if req.user_id else None
+    if user_uuid:
+        user_row = await db.get(User, user_uuid)
+        if user_row:
+            if user_row.lean_score is None:
+                user_row.lean_score = inferred_lean
+            else:
+                # Exponential moving average — recent posts weighted slightly more
+                user_row.lean_score = round(0.7 * user_row.lean_score + 0.3 * inferred_lean, 4)
+
+    # 5. Persist post
     post = Post(
         user_id=user_uuid,
         issue_id=issue.id,
@@ -204,7 +216,7 @@ async def submit_post(req: SubmitPostRequest, db: AsyncSession = Depends(get_db)
     )
     db.add(post)
 
-    # 5. Update issue aggregates
+    # 6. Update issue aggregates
     new_count = issue.post_count + 1
     issue.sentiment_avg = (
         (issue.sentiment_avg * issue.post_count + sentiment) / new_count
@@ -220,7 +232,7 @@ async def submit_post(req: SubmitPostRequest, db: AsyncSession = Depends(get_db)
     )
     issue.updated_at = datetime.utcnow()
 
-    # 6. Optionally refresh summary if post_count crosses a threshold
+    # 7. Optionally refresh summary if post_count crosses a threshold
     SUMMARY_THRESHOLDS = {5, 10, 20, 50}
     if new_count in SUMMARY_THRESHOLDS:
         posts_q = await db.execute(
@@ -410,12 +422,13 @@ async def _recompute_empathy_stats(db: AsyncSession, issue_id: UUID):
         if r.statement_ratings:
             ratings_vals = list(r.statement_ratings.values())
             all_ratings.extend(ratings_vals)
-            # statement 5 is "more common ground" (last statement)
-            key = str(len(r.statement_ratings))
+            # statement index 4 (0-based) is "There's more common ground…" — last of 5
+            key = str(len(r.statement_ratings) - 1)
             if key in r.statement_ratings:
                 shared_vals.append(float(r.statement_ratings[key]))
 
     shared_concern_index = (sum(shared_vals) / len(shared_vals) / 10.0) if shared_vals else 0.0
+
     cross_pos = (sum(all_ratings) / len(all_ratings) / 10.0) if all_ratings else 0.0
 
     pre_intensities = [r.pre_intensity for r in rows if r.pre_intensity is not None]

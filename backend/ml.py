@@ -8,14 +8,16 @@ import math
 from typing import Optional
 import numpy as np
 from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
 _client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_anthropic = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "claude-sonnet-4-6"          # or swap to gpt-4o-mini if preferred
+CHAT_MODEL = "claude-sonnet-4-6"
 SIMILARITY_THRESHOLD = 0.65
 
 
@@ -200,17 +202,19 @@ async def summarize_issue(label: str, posts: list[str]) -> dict:
     combined = "\n---\n".join(posts[:80])   # cap at 80 posts to stay within token budget
     prompt = f"ISSUE: {label}\n\nPOSTS:\n{combined}"
     try:
-        resp = await _client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": _SUMMARIZER_SYSTEM},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=800,
-            response_format={"type": "json_object"},
+        resp = await _anthropic.messages.create(
+            model=CHAT_MODEL,
+            max_tokens=1024,
+            system=_SUMMARIZER_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
         )
-        data = json.loads(resp.choices[0].message.content)
+        raw = resp.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
         return {
             "summary": data.get("summary", ""),
             "side_a_points": data.get("side_a_points", []),

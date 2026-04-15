@@ -40,7 +40,7 @@ export default function EmpathyStats({ stats }) {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
         <div className="space-y-3">
           <StatBar label="People on both sides care about fairness" value={7.8} />
-          <StatBar label="There's more common ground than it seemed" value={stats.shared_concern_index ? stats.shared_concern_index * 10 : 6.4} />
+          <StatBar label="There's more common ground than it seemed" value={(stats.shared_concern_index || 0) * 10} />
         </div>
         <div className="flex flex-col items-center">
           <div className="h-36 w-36">
@@ -64,8 +64,14 @@ export default function EmpathyStats({ stats }) {
       </div>
 
       <div className="flex gap-6 text-sm text-slate-400 border-t border-slate-700 pt-4">
-        <span>Intensity before: <span className="text-white font-medium">{stats.intensity_delta ? (8.2 - stats.intensity_delta).toFixed(1) : '—'}/10</span></span>
-        <span>Intensity after: <span className="text-amber-300 font-medium">{stats.intensity_delta ? (8.2).toFixed(1) : '—'}/10 ↑</span></span>
+        {stats.intensity_delta != null && stats.intensity_delta !== 0 && (
+          <span>
+            Intensity shift:{' '}
+            <span className={stats.intensity_delta > 0 ? 'text-amber-300 font-medium' : 'text-slate-300 font-medium'}>
+              {stats.intensity_delta > 0 ? '+' : ''}{stats.intensity_delta.toFixed(2)} {stats.intensity_delta > 0 ? '↑' : '↓'}
+            </span>
+          </span>
+        )}
         <span className="ml-auto">{stats.total_respondents} respondents</span>
       </div>
     </div>
